@@ -1,0 +1,311 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index b4d29d3aff..97ba0c2b37 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2032,6 +2032,12 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
+ template <class P>
+ void BufferCache<P>::BindHostComputeStorageBuffers() {
+     u32 binding_index = 0;
++    // EDEN_NX2_EXP59 & 4: compute storage synchronizes use only the dirty tracker words.
++    // & 8 verifies that walk while retaining the full walk; bits 1 and 2 are read extents.
++    compute_dirty_walk = VideoCore::Nx2Debug::Experiment(59) & (4 | 8);
++    SCOPE_EXIT {
++        compute_dirty_walk = 0;
++    };
+     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+         const Binding& binding = channel_state->compute_storage_buffers[index];
+         const bool is_written =
+@@ -3105,6 +3111,11 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
+ 
+ template <class P>
+ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
++    if ((compute_dirty_walk & 8) != 0) {
++        const bool walked = VerifyComputeDirtyWalk(device_addr, size);
++        Nx2Profile::Add(Nx2Profile::Counter::ComputeSyncDirtyWalks, 1);
++        Nx2Profile::Add(Nx2Profile::Counter::ComputeSyncDirtySkips, walked ? 0 : 1);
++    }
+     if (!Nx2DrawTuning() || size == 0) {
+         return SynchronizeBufferPages(buffer, device_addr, size);
+     }
+@@ -3128,8 +3139,68 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+     return synchronized;
+ }
+ 
++template <class P>
++bool BufferCache<P>::VerifyComputeDirtyWalk(DAddr device_addr, u32 size) {
++    // The full walk runs after this and is what gets used. A CPU page outside the dirty-word
++    // window is an upload the dirty-word walk would have missed; an Untracked one is a page it
++    // would have left unprotected. Both must stay 0.
++    const auto check = memory_tracker.CheckDirtyWalk(device_addr, size);
++    auto& verify = dirty_walk_verify;
++    ++verify.checked;
++    ++verify.total_checked;
++    if (check.cpu_pages != 0 || check.untracked_pages != 0) [[unlikely]] {
++        ++verify.mismatches;
++        ++verify.total_mismatches;
++        verify.cpu_pages += check.cpu_pages;
++        verify.untracked_pages += check.untracked_pages;
++        if (verify.logged < 16) {
++            ++verify.logged;
++            LOG_ERROR(HW_GPU,
++                      "Nx2 EXP59 verify: the dirty-word walk would differ at {:#x}+{:#x}: {} CPU "
++                      "pages it would not upload, {} Untracked pages it would not re-track",
++                      device_addr, size, check.cpu_pages, check.untracked_pages);
++        }
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (verify.last_report == std::chrono::steady_clock::time_point{}) {
++        verify.last_report = now;
++    } else if (now - verify.last_report >= std::chrono::seconds{10}) {
++        if (verify.mismatches != 0) {
++            LOG_ERROR(HW_GPU,
++                      "Nx2 EXP59 verify, last 10 s: {} of {} compute synchronizes differ ({} CPU "
++                      "pages, {} Untracked pages); since start {} of {}",
++                      verify.mismatches, verify.checked, verify.cpu_pages, verify.untracked_pages,
++                      verify.total_mismatches, verify.total_checked);
++        } else {
++            LOG_INFO(HW_GPU,
++                     "Nx2 EXP59 verify, last 10 s: 0 of {} compute synchronizes differ; since "
++                     "start {} of {}",
++                     verify.checked, verify.total_mismatches, verify.total_checked);
++        }
++        verify.checked = 0;
++        verify.mismatches = 0;
++        verify.cpu_pages = 0;
++        verify.untracked_pages = 0;
++        verify.last_report = now;
++    }
++    return check.walks;
++}
++
+ template <class P>
+ bool BufferCache<P>::SynchronizeBufferPages(Buffer& buffer, DAddr device_addr, u32 size) {
++    // EDEN_NX2_EXP59 & 4 walks only the dirty words for compute storage synchronizes.
++    // & 8 verifies that window in SynchronizeBuffer, then uses the full walk here.
++    const bool compute_verify = (compute_dirty_walk & 8) != 0;
++    const bool compute_fast = !compute_verify && (compute_dirty_walk & 4) != 0;
++    const auto for_each_upload_range = [&](auto&& func) {
++        if (compute_fast) {
++            const bool walked = memory_tracker.ForEachDirtyUploadRange(device_addr, size, func);
++            Nx2Profile::Add(Nx2Profile::Counter::ComputeSyncDirtyWalks, 1);
++            Nx2Profile::Add(Nx2Profile::Counter::ComputeSyncDirtySkips, walked ? 0 : 1);
++        } else {
++            memory_tracker.ForEachUploadRange(device_addr, size, func);
++        }
++    };
+ #ifdef __ANDROID__
+     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
+ #else
+@@ -3152,7 +3223,7 @@ bool BufferCache<P>::SynchronizeBufferPages(Buffer& buffer, DAddr device_addr, u
+             total_size_bytes += range_size;
+             largest_copy = (std::max)(largest_copy, range_size);
+         };
+-        memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
++        for_each_upload_range([&](u64 device_addr_out, u64 range_size) {
+             DAddr upload_start = device_addr_out;
+             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, [&](DAddr gpu_start, DAddr gpu_end) {
+                 add_upload(upload_start, gpu_start);
+@@ -3177,7 +3248,7 @@ bool BufferCache<P>::SynchronizeBufferPages(Buffer& buffer, DAddr device_addr, u
+         u64 total_size_bytes = 0;
+         u64 largest_copy = 0;
+         DAddr buffer_start = buffer.CpuAddr();
+-        memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
++        for_each_upload_range([&](u64 device_addr_out, u64 range_size) {
+             copies.push_back(BufferCopy{
+                 .src_offset = total_size_bytes,
+                 .dst_offset = device_addr_out - buffer_start,
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index a11e74381e..c522700c37 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -673,6 +673,7 @@ private:
+     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
+ 
+     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
++    bool VerifyComputeDirtyWalk(DAddr device_addr, u32 size);
+     bool SynchronizeBufferPages(Buffer& buffer, DAddr device_addr, u32 size);
+ 
+     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
+@@ -911,6 +912,19 @@ private:
+     VirtualRangeCache virtual_ranges;
+     std::vector<MultiRangeSegment> graphics_segments;
+     std::vector<MultiRangeSegment> compute_segments;
++    /// EDEN_NX2_EXP59 bits 4 and 8 while BindHostComputeStorageBuffers runs (0 otherwise).
++    int compute_dirty_walk = 0;
++    /// EXP59 & 8: synchronizes checked and dirty-word mismatches since the last totals line.
++    struct DirtyWalkVerify {
++        u64 checked = 0;
++        u64 mismatches = 0;
++        u64 cpu_pages = 0;
++        u64 untracked_pages = 0;
++        u64 total_checked = 0;
++        u64 total_mismatches = 0;
++        u32 logged = 0;
++        std::chrono::steady_clock::time_point last_report{};
++    } dirty_walk_verify;
+     u64 frame_tick = 0;
+     u64 total_used_memory = 0;
+     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+index 20707d2014..655369e6d0 100644
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -178,6 +178,49 @@ public:
+         }
+     }
+ 
++    /// Returns false when every word was clean (nothing walked at all).
++    template <typename Func>
++    bool ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
++        bool walked = false;
++        IteratePages<true>(query_cpu_range, query_size, [&func, &walked](Manager* manager, u64 offset, size_t size) {
++            const auto [begin, end] = manager->DirtyWindow(offset, size);
++            if (begin >= end) {
++                return;
++            }
++            walked = true;
++            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
++                                          static_cast<s64>(end - begin), func);
++        });
++        return walked;
++    }
++
++    struct DirtyWalkCheck {
++        u64 cpu_pages = 0;       ///< CPU pages the full walk uploads and the dirty-word walk would not
++        u64 untracked_pages = 0; ///< Untracked pages it re-tracks and the dirty-word walk would not
++        bool walks = false;      ///< The dirty-word walk would walk anything (a manager to create counts)
++    };
++    /// EDEN_NX2_EXP59 & 8: what ForEachDirtyUploadRange would leave out of the full walk.
++    [[nodiscard]] DirtyWalkCheck CheckDirtyWalk(VAddr query_cpu_range, u64 query_size) {
++        DirtyWalkCheck check;
++        if (query_size == 0) {
++            return check;
++        }
++        // A missing manager is created by both walks with every word dirty: no difference.
++        const size_t first = query_cpu_range >> HIGHER_PAGE_BITS;
++        const size_t last = (query_cpu_range + query_size - 1) >> HIGHER_PAGE_BITS;
++        for (size_t page_index = first; page_index <= last; ++page_index) {
++            check.walks |= top_tier[page_index] == nullptr;
++        }
++        IteratePages<false>(query_cpu_range, query_size, [&check](Manager* manager, u64 offset, size_t size) {
++            const auto [begin, end] = manager->DirtyWindow(offset, size);
++            check.walks |= begin < end;
++            const auto [cpu_pages, untracked_pages] = manager->DirtyWalkMisses(offset, size);
++            check.cpu_pages += cpu_pages;
++            check.untracked_pages += untracked_pages;
++        });
++        return check;
++    }
++
+     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
+     template <typename Func>
+     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, bool clear, Func&& func) {
+diff --git a/src/video_core/buffer_cache/word_manager.h b/src/video_core/buffer_cache/word_manager.h
+index 8fafa28f89..1faea6c52f 100644
+--- a/src/video_core/buffer_cache/word_manager.h
++++ b/src/video_core/buffer_cache/word_manager.h
+@@ -269,6 +269,54 @@ struct WordManager {
+             : std::make_pair<u64, u64>(0, 0);
+     }
+ 
++    /// Words of [first_word, last_word] that have CPU or Untracked pages, one bit each.
++    /// This port computes the window from the state words because its base predates clean_words.
++    [[nodiscard]] u64 DirtyWords(size_t first_word, size_t last_word) const noexcept {
++        const std::span<const u64> cpu_words = Span(Type::CPU);
++        const std::span<const u64> untracked_words = Span(Type::Untracked);
++        u64 dirty = 0;
++        for (size_t index = first_word; index <= last_word; ++index) {
++            if ((cpu_words[index] | untracked_words[index]) != 0) {
++                dirty |= u64{1} << index;
++            }
++        }
++        return dirty;
++    }
++
++    /// The part of [offset, offset + size) that the dirty-word walk visits: from its first dirty
++    /// word to its last. Empty when all are clean.
++    [[nodiscard]] std::pair<u64, u64> DirtyWindow(u64 offset, u64 size) const noexcept {
++        const u64 dirty = DirtyWords(offset / BYTES_PER_WORD, (offset + size - 1) / BYTES_PER_WORD);
++        if (dirty == 0) {
++            return {offset + size, offset + size};
++        }
++        const u64 begin = (std::max<u64>)(offset, std::countr_zero(dirty) * BYTES_PER_WORD);
++        const u64 end =
++            (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
++        return {begin, end};
++    }
++
++    /// EDEN_NX2_EXP59 & 8: CPU and Untracked pages outside DirtyWindow, counted from the words.
++    [[nodiscard]] std::pair<u64, u64> DirtyWalkMisses(u64 offset, u64 size) const noexcept {
++        const std::span<const u64> cpu_words = Span(Type::CPU);
++        const std::span<const u64> untracked_words = Span(Type::Untracked);
++        const auto [begin, end] = DirtyWindow(offset, size);
++        u64 cpu_pages = 0;
++        u64 untracked_pages = 0;
++        const auto count = [&](u64 from, u64 to) {
++            if (from >= to) {
++                return;
++            }
++            IterateWords(from, to - from, [&](size_t index, u64 mask) {
++                cpu_pages += std::popcount(cpu_words[index] & mask);
++                untracked_pages += std::popcount(untracked_words[index] & mask);
++            });
++        };
++        count(offset, begin);
++        count(end, offset + size);
++        return {cpu_pages, untracked_pages};
++    }
++
+     void FlushCachedWrites() noexcept {
+         ++upload_epoch;
+         auto const cached_words = Span(Type::CachedCPU);
+diff --git a/src/video_core/nx2_debug_control.h b/src/video_core/nx2_debug_control.h
+index 4ac31e54da..725ca719d7 100644
+--- a/src/video_core/nx2_debug_control.h
++++ b/src/video_core/nx2_debug_control.h
+@@ -9,7 +9,8 @@ namespace VideoCore::Nx2Debug {
+ inline int Experiment(int number) noexcept {
+     const char* name = number == 42 ? "EDEN_NX2_EXP42" :
+                        number == 43 ? "EDEN_NX2_EXP43" :
+-                       number == 45 ? "EDEN_NX2_EXP45" : nullptr;
++                       number == 45 ? "EDEN_NX2_EXP45" :
++                       number == 59 ? "EDEN_NX2_EXP59" : nullptr;
+     const int default_value = number == 42 ? 1 : number == 43 ? 3 : 0;
+     if (name == nullptr) {
+         return default_value;
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index 46e0cb6989..4a01cbb380 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -94,7 +94,7 @@ inline u64 Now() {
+ struct ThreadData {
+     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
+-    std::array<u64, 8> counters{}; ///< See Counter
++    std::array<u64, 10> counters{}; ///< See Counter
+     u64 child_ns{};    ///< Time of the zones nested in the current one
+     u64 window_start{};
+ };
+@@ -163,6 +163,8 @@ enum class Counter : u32 {
+     SameValueWrites, ///< Of MethodWrites: the register already held the value
+     AcquireChecks,  ///< Semaphore acquires evaluated
+     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
++    ComputeSyncDirtyWalks, ///< EXP59 compute storage synchronizes using the dirty-word walk
++    ComputeSyncDirtySkips, ///< Of those, every tracker word was clean
+ };
+ 
+ /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
+@@ -247,6 +249,13 @@ inline void Report(const char* thread_name = "GPU thread") {
+     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
+                         static_cast<double>(data.counters[6]) * 1e9 / window,
+                         static_cast<double>(data.counters[7]) * 1e9 / window);
++    if (const u64 walks = data.counters[static_cast<size_t>(Counter::ComputeSyncDirtyWalks)];
++        walks != 0) {
++        const u64 skips = data.counters[static_cast<size_t>(Counter::ComputeSyncDirtySkips)];
++        line += fmt::format(" | dirty-word walk (EXP59) skipped {:.0f} of {:.0f}",
++                            static_cast<double>(skips) * 1e9 / window,
++                            static_cast<double>(walks) * 1e9 / window);
++    }
+     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+     data = {};
+     data.window_start = now;
